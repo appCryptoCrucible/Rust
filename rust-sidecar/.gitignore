@@ -37,7 +37,20 @@ build_release.txt
 # Cargo cache
 .cargo/
 
-# Parent directory files (old C++ project)
+# Parent directory files (old C++ project) - exclude from root
+/include/
+/src/
+/contracts/
+/scripts/
+/CMakeLists.txt
+/.gitignore
+/.gitmodules
+/README.md
+/*.csv
+/*.jsonl
+/*.json
+
+# Also exclude from parent directory (relative paths)
 ../include/
 ../src/
 ../contracts/

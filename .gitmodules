@@ -1,6 +1,0 @@
-[submodule "rust-sidecar/contracts/lib/openzeppelin-contracts"]
-	path = rust-sidecar/contracts/lib/openzeppelin-contracts
-	url = https://github.com/OpenZeppelin/openzeppelin-contracts
-[submodule "rust-sidecar/contracts/lib/forge-std"]
-	path = rust-sidecar/contracts/lib/forge-std
-	url = https://github.com/foundry-rs/forge-std
