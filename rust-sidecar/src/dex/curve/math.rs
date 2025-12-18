@@ -5,9 +5,15 @@
 //! constant sum invariant that allows for efficient stablecoin swaps with
 //! low slippage.
 //!
+//! ## Fee Application
+//!
+//! Fees are applied to the output amount (dy) in `calculate_dy()`, matching
+//! on-chain Curve behavior. Rounding protection reduces the result by 1 wei to
+//! prevent rounding attacks and ensure calculations don't exceed actual output.
+//!
 //! Key formulas:
 //! - Invariant D: D = invariant for n coins with balances x_i and amplification A
-//! - Exchange: dy = calculate_dy(i, j, dx, xp) where xp is modified balances
+//! - Exchange: dy = calculate_dy(i, j, dx, xp, a, fee_bps) where fees are applied internally
 //! - Newton's method: Used for solving the invariant equation
 
 use crate::core::{BasisPoints, MathError};
@@ -478,6 +484,8 @@ pub fn calculate_y(
 /// Calculate dy (swap output amount) for StableSwap
 ///
 /// This calculates how much token j you get for swapping dx of token i.
+/// Fees are applied to the output amount (dy), and rounding protection
+/// reduces the result by 1 wei to match on-chain Curve behavior.
 ///
 /// # Arguments
 /// * `i` - Index of input token
@@ -485,17 +493,19 @@ pub fn calculate_y(
 /// * `dx` - Input amount
 /// * `xp` - Current balances array
 /// * `a` - Amplification coefficient
+/// * `fee_bps` - Swap fee in basis points (e.g., 4 = 0.04%)
 ///
 /// # Returns
-/// * `Ok(u256)` - Output amount
-/// * `Err(String)` - Calculation error
-/// Calculate dy (swap output amount) for StableSwap
+/// * `Ok(u256)` - Output amount after fees and rounding protection
+/// * `Err(MathError)` - Calculation error
 ///
 /// The Curve invariant D stays constant during a swap:
 /// 1. Calculate D for current balances
 /// 2. After adding dx to token i, find new balance y for token j that maintains D
-/// 3. dy = xp[j] - y (amount we receive)
-pub fn calculate_dy(i: usize, j: usize, dx: u256, xp: &[u256], a: u256) -> Result<u256, MathError> {
+/// 3. dy = xp[j] - y (amount before fees)
+/// 4. Apply fee to dy: dy = dy - (dy * fee_bps / 10000)
+/// 5. Apply rounding protection: dy = dy - 1
+pub fn calculate_dy(i: usize, j: usize, dx: u256, xp: &[u256], a: u256, fee_bps: u32) -> Result<u256, MathError> {
     let n = xp.len();
 
     if i >= n || j >= n {
@@ -531,13 +541,37 @@ pub fn calculate_dy(i: usize, j: usize, dx: u256, xp: &[u256], a: u256) -> Resul
     // NOTE: Use the ORIGINAL D, not a recalculated one
     let y = calculate_y(i, j, dx, &xp_modified, a, d)?;
 
-    // dy = xp[j] - y (the amount we receive)
+    // dy = xp[j] - y (the amount we receive before fees)
     if y >= xp[j] {
         // This can happen if the pool is highly imbalanced or dx is too large
         return Ok(u256::zero());
     }
 
-    let dy = xp[j] - y;
+    let mut dy = xp[j] - y;
+
+    // Apply fee to OUTPUT (Curve applies fee to dy, not dx)
+    // Fee formula: fee_amount = dy * fee_bps / 10000
+    let fee_amount = dy
+        .checked_mul(u256::from(fee_bps))
+        .and_then(|v| v.checked_div(u256::from(10000)))
+        .ok_or_else(|| MathError::Overflow {
+            operation: "calculate_dy".to_string(),
+            inputs: vec![dy, u256::from(fee_bps)],
+            context: "Fee calculation overflow".to_string(),
+        })?;
+
+    dy = dy.checked_sub(fee_amount).ok_or_else(|| {
+        MathError::Underflow {
+            operation: "calculate_dy".to_string(),
+            inputs: vec![dy, fee_amount],
+            context: "Fee subtraction underflow".to_string(),
+        }
+    })?;
+
+    // CRITICAL: Rounding protection (prevents rounding attacks)
+    // Curve reduces dy by 1 wei to ensure calculations don't exceed actual output
+    dy = dy.saturating_sub(u256::from(1));
+
     Ok(dy)
 }
 
@@ -561,8 +595,9 @@ pub fn calculate_swap_output(
     token_out_index: usize,
     balances: &[u256],
     a: u256,
+    fee_bps: u32,
 ) -> Result<u256, MathError> {
-    calculate_dy(token_in_index, token_out_index, amount_in, balances, a)
+    calculate_dy(token_in_index, token_out_index, amount_in, balances, a, fee_bps)
 }
 
 /// Calculate spot price for Curve cryptoswap
@@ -587,7 +622,7 @@ pub fn calculate_curve_price(
     // Use a small test amount to calculate marginal price
     let test_amount = u256::from(1000000); // 1e6 (small amount)
 
-    let dy = calculate_dy(token_in_index, token_out_index, test_amount, balances, a)?;
+    let dy = calculate_dy(token_in_index, token_out_index, test_amount, balances, a, 0)?; // Price calculation uses zero fee
 
     // Price = dy / dx, scaled appropriately
     // Since both are in the same units, price represents the exchange rate
@@ -816,7 +851,7 @@ mod tests {
         let a = u256::from(100);
         let dx = u256::from(1000000000000000000u64); // 1 token
 
-        let result = calculate_dy(0, 1, dx, &balances, a);
+        let result = calculate_dy(0, 1, dx, &balances, a, 4); // Use 4 bps (0.04% typical Curve fee)
         assert!(result.is_ok(), "Swap calculation should succeed");
 
         let dy = result.unwrap();
@@ -975,7 +1010,7 @@ mod tests {
         let dx = u256::from(1000000000000000000u64); // 1 token
 
         // Use calculate_dy to get expected output
-        let dy_result = calculate_dy(0, 1, dx, &balances, a);
+        let dy_result = calculate_dy(0, 1, dx, &balances, a, 4); // Use 4 bps (0.04% typical Curve fee)
         assert!(dy_result.is_ok(), "calculate_dy should succeed");
         let expected_dy = dy_result.unwrap();
 
@@ -1125,7 +1160,7 @@ mod tests {
         let dx = u256::from(1000000000000000000u64);
 
         // This might overflow - should return proper error, not panic
-        let result = calculate_dy(0, 1, dx, &balances, a);
+        let result = calculate_dy(0, 1, dx, &balances, a, 4); // Use 4 bps (0.04% typical Curve fee)
         // Should either succeed or return proper error, not panic
         assert!(
             result.is_ok() || matches!(result, Err(MathError::Overflow { .. })),
@@ -1284,23 +1319,16 @@ pub fn calculate_curve_sandwich_profit(
     let frontrun_token_in = 0;
     let frontrun_token_out = 1;
 
-    // Calculate reserves after frontrun
-    let raw_frontrun_output = calculate_dy(
+    // Frontrun: calculate_dy now includes fees internally
+    let frontrun_output = calculate_dy(
         frontrun_token_in,
         frontrun_token_out,
         frontrun_amount,
         balances,
         amplification,
+        fee_bps.as_u32(),  // Pass fee to calculate_dy
     )?;
-
-    // Apply Curve fee to frontrun output
-    let fee_amount = raw_frontrun_output
-        .checked_mul(curve_fee)
-        .and_then(|v| v.checked_div(U256::from(10000)))
-        .unwrap_or(U256::zero());
-    let frontrun_output = raw_frontrun_output
-        .checked_sub(fee_amount)
-        .unwrap_or(U256::zero());
+    // NOTE: Fees and rounding protection already applied by calculate_dy
     let mut balances_post_frontrun = balances.to_vec();
     balances_post_frontrun[frontrun_token_in] = balances_post_frontrun[frontrun_token_in]
         .checked_add(frontrun_amount)
@@ -1324,6 +1352,7 @@ pub fn calculate_curve_sandwich_profit(
         victim_amount,
         &balances_post_frontrun,
         amplification,
+        fee_bps.as_u32(),  // Pass fee to calculate_dy
     )?;
     let mut balances_post_victim = balances_post_frontrun;
     balances_post_victim[frontrun_token_in] = balances_post_victim[frontrun_token_in]
@@ -1348,6 +1377,7 @@ pub fn calculate_curve_sandwich_profit(
         frontrun_output,
         &balances_post_victim,
         amplification,
+        fee_bps.as_u32(),  // Pass fee to calculate_dy
     )?;
 
     // Calculate flash loan cost
@@ -1375,6 +1405,7 @@ pub fn calculate_curve_post_frontrun_balances(
     frontrun_amount: U256,
     balances: &[U256],
     amplification: U256,
+    fee_bps: u32,
 ) -> Result<Vec<U256>, MathError> {
     let frontrun_token_in = 0;
     let frontrun_token_out = 1;
@@ -1385,6 +1416,7 @@ pub fn calculate_curve_post_frontrun_balances(
         frontrun_amount,
         balances,
         amplification,
+        fee_bps,
     )?;
     let mut new_balances = balances.to_vec();
     new_balances[frontrun_token_in] = new_balances[frontrun_token_in]
@@ -1408,16 +1440,18 @@ pub fn calculate_curve_post_victim_balances(
     victim_amount: U256,
     balances: &[U256],
     amplification: U256,
+    fee_bps: u32,
 ) -> Result<Vec<U256>, MathError> {
-    calculate_curve_post_frontrun_balances(victim_amount, balances, amplification)
+    calculate_curve_post_frontrun_balances(victim_amount, balances, amplification, fee_bps)
 }
 
 pub fn simulate_victim_execution(
     victim_amount: U256,
     balances: &[U256],
     amplification: U256,
+    fee_bps: u32,
 ) -> Result<Vec<U256>, MathError> {
-    calculate_curve_post_victim_balances(victim_amount, balances, amplification)
+    calculate_curve_post_victim_balances(victim_amount, balances, amplification, fee_bps)
 }
 
 /// Swap execution for Curve pool
@@ -1443,18 +1477,18 @@ pub fn simulate_curve_swap_for_jit(
     a: U256,
     fee_bps: u32,
 ) -> Result<CurveSwapExecution, MathError> {
-    // Calculate output using existing Curve math (implements Curve's exact formula)
-    let dy = calculate_dy(i, j, dx, balances, a)?;
+    // Calculate output using calculate_dy (now includes fees and rounding protection)
+    let dy = calculate_dy(i, j, dx, balances, a, fee_bps)?;
 
-    // Calculate fee
-    let fee_amount = dx
+    // Fee is already applied in calculate_dy, but we need to track it for accounting
+    // Fee amount = dy_before_fee * fee_bps / 10000
+    // Since calculate_dy returns dy_after_fee, we need to reverse calculate
+    // dy_before_fee = dy_after_fee / (1 - fee_bps/10000)
+    // For accounting: fee_amount ≈ dy * fee_bps / (10000 - fee_bps)
+    let fee_amount = dy
         .checked_mul(U256::from(fee_bps))
-        .and_then(|v| v.checked_div(U256::from(10000)))
-        .ok_or_else(|| MathError::Overflow {
-            operation: "simulate_curve_swap_for_jit".to_string(),
-            inputs: vec![dx],
-            context: "fee calculation".to_string(),
-        })?;
+        .and_then(|v| v.checked_div(U256::from(10000).checked_sub(U256::from(fee_bps)).unwrap_or(U256::from(1))))
+        .unwrap_or(U256::zero());
 
     // Calculate new balances after swap
     let mut new_balances = balances.to_vec();

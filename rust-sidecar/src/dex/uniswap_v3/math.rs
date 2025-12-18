@@ -12,6 +12,19 @@ use ethers::types::U256;
 use primitive_types::U512;
 use std::sync::OnceLock;
 
+/// Rounding direction for Uniswap V3 amount calculations
+/// 
+/// Uniswap V3 uses asymmetric rounding:
+/// - RoundUp: When trader pays (overcharge trader, favor pool)
+/// - RoundDown: When pool pays (underpay trader, favor pool)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rounding {
+    /// Round up (ceil) - used when computing trader input amounts
+    Up,
+    /// Round down (floor) - used when computing pool output amounts
+    Down,
+}
+
 /// Minimum tick value
 pub const MIN_TICK: i32 = -887272;
 
@@ -678,8 +691,11 @@ fn newton_iteration(tick: i32, sqrt_price_x96: U256) -> Result<i32, MathError> {
     Ok(tick_new)
 }
 
-/// Convert sqrt_price (Q64.96) to tick index
-/// Uses Newton's method with binary search fallback for optimal performance
+/// Convert sqrt price (Q64.96) to tick index (Uniswap V3 TickMath.getTickAtSqrtRatio)
+/// 
+/// PROTOCOL PARITY: Returns the greatest tick t such that getSqrtRatioAtTick(t) <= sqrtPriceX96
+/// This matches on-chain getTickAtSqrtRatio behavior exactly (strict flooring, not nearest).
+/// Uses Newton's method with binary search fallback for optimal performance.
 ///
 /// Algorithm:
 /// 1. Calculate initial guess using binary search (5 iterations for fast approximation)
@@ -687,7 +703,7 @@ fn newton_iteration(tick: i32, sqrt_price_x96: U256) -> Result<i32, MathError> {
 ///    where f(tick) = get_sqrt_ratio_at_tick(tick) - sqrt_price_x96
 ///    and f'(tick) is calculated using numerical derivative (central/forward/backward difference)
 /// 3. Check convergence: |f(tick)| < tolerance (1 part per billion)
-/// 4. If Newton's method converges, verify result by checking neighbors and return closest tick
+/// 4. If Newton's method converges, find greatest tick where sqrtRatio <= sqrtPriceX96 (strict flooring)
 /// 5. If Newton's method fails to converge, fallback to binary search for 100% reliability
 ///
 /// Performance:
@@ -699,7 +715,7 @@ fn newton_iteration(tick: i32, sqrt_price_x96: U256) -> Result<i32, MathError> {
 /// * `sqrt_price_x96` - Sqrt price in Q64.96 format
 ///
 /// # Returns
-/// * `Ok(i32)` - Tick index (closest tick to the given sqrt_price)
+/// * `Ok(i32)` - Tick index (greatest tick where sqrtRatio <= sqrtPriceX96)
 /// * `Err(MathError)` - If sqrt_price out of valid range
 pub fn sqrt_price_to_tick(sqrt_price_x96: U256) -> Result<i32, MathError> {
     // Validate bounds (same as before)
@@ -736,77 +752,40 @@ pub fn sqrt_price_to_tick(sqrt_price_x96: U256) -> Result<i32, MathError> {
     for _iteration in 0..MAX_ITERATIONS {
         // Check convergence
         if check_convergence(tick, sqrt_price_x96, tolerance)? {
-            // Verify result is correct by checking neighbors
-            let tick_low = tick.saturating_sub(1).max(MIN_TICK);
-            let tick_high = tick.saturating_add(1).min(MAX_TICK);
-
-            let sqrt_low = get_sqrt_ratio_at_tick(tick_low)?;
-            let sqrt_high = get_sqrt_ratio_at_tick(tick_high)?;
-            let sqrt_current = get_sqrt_ratio_at_tick(tick)?;
-
-            // Find which tick is closest to target
-            let diff_low = if sqrt_low >= sqrt_price_x96 {
-                sqrt_low
-                    .checked_sub(sqrt_price_x96)
-                    .ok_or_else(|| MathError::Underflow {
-                        operation: "sqrt_price_to_tick".to_string(),
-                        inputs: vec![sqrt_low, sqrt_price_x96],
-                        context: "diff_low calculation".to_string(),
-                    })?
-            } else {
-                sqrt_price_x96
-                    .checked_sub(sqrt_low)
-                    .ok_or_else(|| MathError::Underflow {
-                        operation: "sqrt_price_to_tick".to_string(),
-                        inputs: vec![sqrt_price_x96, sqrt_low],
-                        context: "diff_low calculation".to_string(),
-                    })?
-            };
-
-            let diff_current = if sqrt_current >= sqrt_price_x96 {
-                sqrt_current
-                    .checked_sub(sqrt_price_x96)
-                    .ok_or_else(|| MathError::Underflow {
-                        operation: "sqrt_price_to_tick".to_string(),
-                        inputs: vec![sqrt_current, sqrt_price_x96],
-                        context: "diff_current calculation".to_string(),
-                    })?
-            } else {
-                sqrt_price_x96
-                    .checked_sub(sqrt_current)
-                    .ok_or_else(|| MathError::Underflow {
-                        operation: "sqrt_price_to_tick".to_string(),
-                        inputs: vec![sqrt_price_x96, sqrt_current],
-                        context: "diff_current calculation".to_string(),
-                    })?
-            };
-
-            let diff_high = if sqrt_high >= sqrt_price_x96 {
-                sqrt_high
-                    .checked_sub(sqrt_price_x96)
-                    .ok_or_else(|| MathError::Underflow {
-                        operation: "sqrt_price_to_tick".to_string(),
-                        inputs: vec![sqrt_high, sqrt_price_x96],
-                        context: "diff_high calculation".to_string(),
-                    })?
-            } else {
-                sqrt_price_x96
-                    .checked_sub(sqrt_high)
-                    .ok_or_else(|| MathError::Underflow {
-                        operation: "sqrt_price_to_tick".to_string(),
-                        inputs: vec![sqrt_price_x96, sqrt_high],
-                        context: "diff_high calculation".to_string(),
-                    })?
-            };
-
-            // Return closest tick
-            if diff_low <= diff_current && diff_low <= diff_high {
-                return Ok(tick_low);
-            } else if diff_high <= diff_current {
-                return Ok(tick_high);
-            } else {
-                return Ok(tick);
+            // PROTOCOL PARITY: Use strict flooring, not "closest tick"
+            // On-chain getTickAtSqrtRatio returns greatest tick t where getSqrtRatioAtTick(t) <= sqrtPriceX96
+            // This is strict ≤ semantics, not nearest-neighbor
+            
+            // Start with candidate tick from Newton's method
+            let mut candidate_tick = tick;
+            
+            // Verify candidate: getSqrtRatioAtTick(candidate) <= sqrtPriceX96
+            let candidate_sqrt = get_sqrt_ratio_at_tick(candidate_tick)?;
+            if candidate_sqrt > sqrt_price_x96 {
+                // Candidate is too high, move down
+                candidate_tick = candidate_tick.saturating_sub(1).max(MIN_TICK);
             }
+            
+            // Find greatest tick where sqrtRatio <= sqrtPriceX96
+            // Walk upward while next tick's sqrtRatio <= sqrtPriceX96
+            while candidate_tick < MAX_TICK {
+                let next_tick = candidate_tick + 1;
+                let next_sqrt = get_sqrt_ratio_at_tick(next_tick)?;
+                if next_sqrt <= sqrt_price_x96 {
+                    candidate_tick = next_tick;
+                } else {
+                    break;
+                }
+            }
+            
+            // Final verification: ensure candidate_tick satisfies the condition
+            let final_sqrt = get_sqrt_ratio_at_tick(candidate_tick)?;
+            if final_sqrt > sqrt_price_x96 {
+                // Should never happen, but safety check
+                candidate_tick = candidate_tick.saturating_sub(1).max(MIN_TICK);
+            }
+            
+            return Ok(candidate_tick);
         }
 
         // Perform Newton iteration
@@ -822,7 +801,7 @@ pub fn sqrt_price_to_tick(sqrt_price_x96: U256) -> Result<i32, MathError> {
     }
 
     // Fallback to binary search if Newton's method didn't converge
-    // This ensures 100% reliability
+    // PROTOCOL PARITY: Binary search also uses strict flooring
     let mut low = MIN_TICK;
     let mut high = MAX_TICK;
 
@@ -831,13 +810,32 @@ pub fn sqrt_price_to_tick(sqrt_price_x96: U256) -> Result<i32, MathError> {
         let mid_sqrt = get_sqrt_ratio_at_tick(mid)?;
 
         if sqrt_price_x96 >= mid_sqrt {
+            // mid_sqrt <= sqrt_price_x96, so mid is a valid candidate
+            // Continue searching upward
             low = mid;
         } else {
+            // mid_sqrt > sqrt_price_x96, so mid is too high
             high = mid;
         }
     }
 
-    // Return the lower tick (conservative, same as original)
+    // After binary search, 'low' is the greatest tick where getSqrtRatioAtTick(low) <= sqrtPriceX96
+    // Verify this condition holds
+    let low_sqrt = get_sqrt_ratio_at_tick(low)?;
+    if low_sqrt > sqrt_price_x96 {
+        // Should never happen, but safety check
+        return Ok(MIN_TICK);
+    }
+    
+    // Final check: if next tick also satisfies condition, use it (strict flooring: greatest tick)
+    if low < MAX_TICK {
+        let next_tick = low + 1;
+        let next_sqrt = get_sqrt_ratio_at_tick(next_tick)?;
+        if next_sqrt <= sqrt_price_x96 {
+            return Ok(next_tick);
+        }
+    }
+    
     Ok(low)
 }
 
@@ -1079,6 +1077,143 @@ pub fn mul_div_rounding_up(a: U256, b: U256, denominator: U256) -> Result<U256, 
             _ => e,
         }
     })
+}
+
+/// Calculate amount0 delta between two sqrt prices (Uniswap V3 SqrtPriceMath.getAmount0Delta)
+/// 
+/// Formula: amount0 = L * Q96 * (sqrtB - sqrtA) / (sqrtA * sqrtB)
+/// 
+/// # Arguments
+/// * `sqrt_ratio_a` - Lower sqrt price in Q64.96 format
+/// * `sqrt_ratio_b` - Upper sqrt price in Q64.96 format
+/// * `liquidity` - Liquidity amount
+/// * `round_up` - If true, round up (trader pays). If false, round down (pool pays).
+/// 
+/// # Returns
+/// * `Ok(U256)` - Amount0 delta
+/// * `Err(MathError)` - If calculation fails
+/// 
+/// # Protocol Rules
+/// - When computing trader input: round_up = true (overcharge trader)
+/// - When computing pool output: round_up = false (underpay trader)
+pub fn get_amount0_delta(
+    sqrt_ratio_a: U256,
+    sqrt_ratio_b: U256,
+    liquidity: u128,
+    round_up: bool,
+) -> Result<U256, MathError> {
+    if sqrt_ratio_a >= sqrt_ratio_b {
+        return Err(MathError::InvalidInput {
+            operation: "get_amount0_delta".to_string(),
+            reason: format!(
+                "sqrt_ratio_a ({}) must be less than sqrt_ratio_b ({})",
+                sqrt_ratio_a, sqrt_ratio_b
+            ),
+            context: "Uniswap V3 amount0 delta calculation".to_string(),
+        });
+    }
+
+    if liquidity == 0 {
+        return Ok(U256::zero());
+    }
+
+    let q96 = U256::from(1u128 << 96);
+    let liquidity_u256 = U256::from(liquidity);
+
+    // PROTOCOL PARITY: Match Solidity operation order exactly
+    // Solidity: FullMath.mulDiv(liquidity, sqrtBX96 - sqrtAX96, sqrtAX96) * Q96 / sqrtBX96
+    // Order: (L * (sqrtB - sqrtA) / sqrtA) * Q96 / sqrtB
+    
+    let sqrt_diff = sqrt_ratio_b
+        .checked_sub(sqrt_ratio_a)
+        .ok_or_else(|| MathError::Underflow {
+            operation: "get_amount0_delta".to_string(),
+            inputs: vec![sqrt_ratio_b, sqrt_ratio_a],
+            context: "sqrt price difference calculation".to_string(),
+        })?;
+
+    // Step 1: (L * (sqrtB - sqrtA)) / sqrtA
+    // Use mul_div for intermediate result
+    let intermediate = if round_up {
+        mul_div_rounding_up(liquidity_u256, sqrt_diff, sqrt_ratio_a)?
+    } else {
+        mul_div(liquidity_u256, sqrt_diff, sqrt_ratio_a)?
+    };
+
+    // Step 2: intermediate * Q96 / sqrtB
+    if round_up {
+        mul_div_rounding_up(intermediate, q96, sqrt_ratio_b)
+    } else {
+        mul_div(intermediate, q96, sqrt_ratio_b)
+    }
+}
+
+/// Calculate amount1 delta between two sqrt prices (Uniswap V3 SqrtPriceMath.getAmount1Delta)
+/// 
+/// Formula: amount1 = L * (sqrtB - sqrtA) / Q96
+/// 
+/// # Arguments
+/// * `sqrt_ratio_a` - Lower sqrt price in Q64.96 format
+/// * `sqrt_ratio_b` - Upper sqrt price in Q64.96 format
+/// * `liquidity` - Liquidity amount
+/// * `round_up` - If true, round up (trader pays). If false, round down (pool pays).
+/// 
+/// # Returns
+/// * `Ok(U256)` - Amount1 delta
+/// * `Err(MathError)` - If calculation fails
+/// 
+/// # Protocol Rules
+/// - When computing trader input: round_up = true (overcharge trader)
+/// - When computing pool output: round_up = false (underpay trader)
+pub fn get_amount1_delta(
+    sqrt_ratio_a: U256,
+    sqrt_ratio_b: U256,
+    liquidity: u128,
+    round_up: bool,
+) -> Result<U256, MathError> {
+    if sqrt_ratio_a >= sqrt_ratio_b {
+        return Err(MathError::InvalidInput {
+            operation: "get_amount1_delta".to_string(),
+            reason: format!(
+                "sqrt_ratio_a ({}) must be less than sqrt_ratio_b ({})",
+                sqrt_ratio_a, sqrt_ratio_b
+            ),
+            context: "Uniswap V3 amount1 delta calculation".to_string(),
+        });
+    }
+
+    if liquidity == 0 {
+        return Ok(U256::zero());
+    }
+
+    let q96 = U256::from(1u128 << 96);
+    let liquidity_u256 = U256::from(liquidity);
+
+    // Formula: amount1 = L * (sqrtB - sqrtA) / Q96
+    // Operation order matches Solidity: multiply first, then divide
+    let sqrt_diff = sqrt_ratio_b
+        .checked_sub(sqrt_ratio_a)
+        .ok_or_else(|| MathError::Underflow {
+            operation: "get_amount1_delta".to_string(),
+            inputs: vec![sqrt_ratio_b, sqrt_ratio_a],
+            context: "sqrt price difference calculation".to_string(),
+        })?;
+
+    // Numerator: L * (sqrtB - sqrtA)
+    let numerator = liquidity_u256
+        .checked_mul(sqrt_diff)
+        .ok_or_else(|| MathError::Overflow {
+            operation: "get_amount1_delta".to_string(),
+            inputs: vec![liquidity_u256, sqrt_diff],
+            context: "numerator calculation".to_string(),
+        })?;
+
+    // Apply rounding based on direction
+    if round_up {
+        mul_div_rounding_up(numerator, U256::from(1), q96)
+    } else {
+        mul_div(numerator, U256::from(1), q96)
+    }
 }
 
 /// Calculate V3 price impact in basis points
@@ -1377,28 +1512,23 @@ pub fn calculate_v3_amount_out(
             let new_sqrt_price = mul_div(numerator, sqrt_price_x96, denominator)?;
 
             // Calculate amount_out using getAmount1Delta formula
+            // PROTOCOL PARITY: Use explicit get_amount1_delta with round_down (pool pays)
             // amount_out = L * (sqrtPrice - new_sqrtPrice) / Q96
             if new_sqrt_price >= sqrt_price_x96 {
                 return Err(MathError::InvalidInput {
-            operation: "calculate_v3_amount_out".to_string(),
+                    operation: "calculate_v3_amount_out".to_string(),
                     reason: "New sqrt price must be less than current for zeroForOne swap".to_string(),
                     context: format!("direction={:?}, sqrt_price={}, new_sqrt_price={}, amount_in={}, liquidity={}", direction, sqrt_price_x96, new_sqrt_price, amount_in, liquidity),
                 });
             }
 
-            let sqrt_price_diff =
-                sqrt_price_x96
-                    .checked_sub(new_sqrt_price)
-                    .ok_or_else(|| MathError::Underflow {
-                        operation: "calculate_v3_amount_out".to_string(),
-                        inputs: vec![sqrt_price_x96, new_sqrt_price],
-                        context: format!(
-                            "zeroForOne sqrt price difference (direction={:?})",
-                            direction
-                        ),
-                    })?;
-
-            let amount_out = mul_div(liquidity_u256, sqrt_price_diff, q96)?;
+            // Use explicit get_amount1_delta with round_down (pool output, favor pool)
+            let amount_out = get_amount1_delta(
+                new_sqrt_price,
+                sqrt_price_x96,
+                liquidity,
+                false, // round_down: pool pays, underpay trader
+            )?;
             Ok(amount_out)
         }
         SwapDirection::Token1ToToken0 => {
@@ -1416,6 +1546,7 @@ pub fn calculate_v3_amount_out(
                 })?;
 
             // Calculate amount_out using getAmount0Delta formula
+            // PROTOCOL PARITY: Use explicit get_amount0_delta with round_down (pool pays)
             // amount_out = L * Q96 * (new_sqrtPrice - sqrtPrice) / (sqrtPrice * new_sqrtPrice)
             let sqrt_price_diff =
                 new_sqrt_price
@@ -1429,8 +1560,13 @@ pub fn calculate_v3_amount_out(
                         ),
                     })?;
 
-            let numerator = mul_div(liquidity_u256, sqrt_price_diff, sqrt_price_x96)?;
-            let amount_out = mul_div(numerator, q96, new_sqrt_price)?;
+            // Use explicit get_amount0_delta with round_down (pool output, favor pool)
+            let amount_out = get_amount0_delta(
+                sqrt_price_x96,
+                new_sqrt_price,
+                liquidity,
+                false, // round_down: pool pays, underpay trader
+            )?;
             Ok(amount_out)
         }
     }
@@ -2809,13 +2945,11 @@ mod tests {
         for test_tick in [1, 10, 100, 1000, 10000, 100000] {
             let sqrt_price = get_sqrt_ratio_at_tick(test_tick).unwrap();
             let calculated_tick = sqrt_price_to_tick(sqrt_price).unwrap();
-            // Allow ±1 tick difference due to rounding
-            assert!(
-                (calculated_tick - test_tick).abs() <= 1,
+            // PROTOCOL PARITY: Exact match required (strict flooring)
+            assert_eq!(
+                calculated_tick, test_tick,
                 "Tick mismatch: expected {}, got {} for sqrt_price={}",
-                test_tick,
-                calculated_tick,
-                sqrt_price
+                test_tick, calculated_tick, sqrt_price
             );
             // Verify the calculated tick produces a sqrt_price close to target
             let calculated_sqrt = get_sqrt_ratio_at_tick(calculated_tick).unwrap();
@@ -2838,13 +2972,11 @@ mod tests {
         for test_tick in [-1, -10, -100, -1000, -10000, -100000] {
             let sqrt_price = get_sqrt_ratio_at_tick(test_tick).unwrap();
             let calculated_tick = sqrt_price_to_tick(sqrt_price).unwrap();
-            // Allow ±1 tick difference due to rounding
-            assert!(
-                (calculated_tick - test_tick).abs() <= 1,
+            // PROTOCOL PARITY: Exact match required (strict flooring)
+            assert_eq!(
+                calculated_tick, test_tick,
                 "Tick mismatch: expected {}, got {} for sqrt_price={}",
-                test_tick,
-                calculated_tick,
-                sqrt_price
+                test_tick, calculated_tick, sqrt_price
             );
         }
     }
@@ -2913,13 +3045,11 @@ mod tests {
             let sqrt_price = get_sqrt_ratio_at_tick(original_tick).unwrap();
             let calculated_tick = sqrt_price_to_tick(sqrt_price).unwrap();
 
-            // Allow ±1 tick difference due to rounding in Newton's method
-            assert!(
-                (calculated_tick - original_tick).abs() <= 1,
+            // PROTOCOL PARITY: Exact match required (strict flooring)
+            assert_eq!(
+                calculated_tick, original_tick,
                 "Roundtrip failed: original_tick={}, calculated_tick={}, sqrt_price={}",
-                original_tick,
-                calculated_tick,
-                sqrt_price
+                original_tick, calculated_tick, sqrt_price
             );
 
             // Verify the calculated tick produces a sqrt_price close to original
@@ -2958,6 +3088,66 @@ mod tests {
         };
         // Should be very close (within 1 part per million)
         assert!(diff < sqrt_price / U256::from(1_000_000));
+    }
+
+    #[test]
+    fn test_get_amount0_delta_rounding() {
+        // Test rounding direction matters
+        let sqrt_a = U256::from(79228162514264337593543950336u128); // tick 0
+        let sqrt_b = U256::from(79236108205323166380068368726u128); // tick 1
+        let liquidity = 1000000u128;
+
+        let round_down = get_amount0_delta(sqrt_a, sqrt_b, liquidity, false).unwrap();
+        let round_up = get_amount0_delta(sqrt_a, sqrt_b, liquidity, true).unwrap();
+
+        // Round up should be >= round down
+        assert!(round_up >= round_down, "round_up ({}) should be >= round_down ({})", round_up, round_down);
+        
+        // For non-exact divisions, round_up should be exactly 1 more than round_down
+        // (unless division is exact, in which case they're equal)
+        if round_up != round_down {
+            assert_eq!(round_up, round_down + U256::from(1), "round_up should be exactly 1 more than round_down");
+        }
+    }
+
+    #[test]
+    fn test_get_amount1_delta_rounding() {
+        // Test rounding direction matters
+        let sqrt_a = U256::from(79228162514264337593543950336u128); // tick 0
+        let sqrt_b = U256::from(79236108205323166380068368726u128); // tick 1
+        let liquidity = 1000000u128;
+
+        let round_down = get_amount1_delta(sqrt_a, sqrt_b, liquidity, false).unwrap();
+        let round_up = get_amount1_delta(sqrt_a, sqrt_b, liquidity, true).unwrap();
+
+        // Round up should be >= round down
+        assert!(round_up >= round_down, "round_up ({}) should be >= round_down ({})", round_up, round_down);
+        
+        // For non-exact divisions, round_up should be exactly 1 more than round_down
+        if round_up != round_down {
+            assert_eq!(round_up, round_down + U256::from(1), "round_up should be exactly 1 more than round_down");
+        }
+    }
+
+    #[test]
+    fn test_sqrt_price_to_tick_strict_flooring() {
+        // Test that sqrt_price_to_tick uses strict flooring (not nearest)
+        // For a sqrt price exactly at tick boundary, should return that tick
+        let tick_0_sqrt = U256::from(79228162514264337593543950336u128);
+        let tick_1_sqrt = get_sqrt_ratio_at_tick(1).unwrap();
+        
+        // Price exactly at tick 0
+        let tick = sqrt_price_to_tick(tick_0_sqrt).unwrap();
+        assert_eq!(tick, 0, "Price at tick 0 should return tick 0");
+        
+        // Price just below tick 1 should return tick 0 (flooring)
+        let just_below_tick_1 = tick_1_sqrt - U256::from(1);
+        let tick = sqrt_price_to_tick(just_below_tick_1).unwrap();
+        assert_eq!(tick, 0, "Price just below tick 1 should return tick 0 (flooring)");
+        
+        // Price exactly at tick 1 should return tick 1
+        let tick = sqrt_price_to_tick(tick_1_sqrt).unwrap();
+        assert_eq!(tick, 1, "Price at tick 1 should return tick 1");
     }
 
     #[test]

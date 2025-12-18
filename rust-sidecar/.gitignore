@@ -1,0 +1,56 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment files
+.env
+.env.local
+*.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Cargo
+Cargo.lock
+
+# Documentation/plan files (temporary)
+*.plan.md
+*_ANALYSIS.md
+*_COMPARISON.md
+*_AUDIT.md
+
+# Build artifacts
+build_release.txt
+
+# Cursor AI files
+.cursor/
+
+# Cargo cache
+.cargo/
+
+# Parent directory files (old C++ project)
+../include/
+../src/
+../contracts/
+../scripts/
+../CMakeLists.txt
+../.gitignore
+../.gitmodules
+../README.md
+../*.csv
+../*.jsonl
+../*.json
+
+# Submodules (if any)
+flashbots-mev-boost/
+reth-block-builder/
+
